@@ -1,0 +1,546 @@
+<?php
+
+namespace CompanyNameProject\DeleteChat;
+
+use Bitrix\Im\Model\ChatIndexTable;
+use Bitrix\Im\Model\ChatTable;
+use Bitrix\Im\Model\MessageParamTable;
+use Bitrix\Im\Model\MessageTable;
+use Bitrix\Im\Model\RelationTable;
+use Bitrix\Main\ORM\Data\DeleteResult;
+use Bitrix\Main\UserTable;
+use CUser;
+
+class Chat extends Base
+{
+    /**
+     * @var \Bitrix\Main\ORM\Entity
+     */
+    private static $firedChatEntity; //сущность чатов
+    private static $firedChatMessageEntity; //сущность сообщений
+    private static $firedMessageParamEntity; //сущность параметров сообщений
+    private static $firedFileMessageEntity; //сущность вложений
+    private static $firedRelationEntity; //сущность связей
+
+    protected static function compileEntitys()
+    {
+        self::$firedChatEntity = \Bitrix\Main\ORM\Entity::compileEntity(
+            'FiredChatEntity',
+            [
+                (new \Bitrix\Main\ORM\Fields\IntegerField('ID'))->configurePrimary(),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('AUTHOR_ID')),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('USER_COUNT')),
+                (new \Bitrix\Main\ORM\Fields\StringField('TYPE')),
+            ],
+            [
+                'table_name' => 'b_im_chat'
+            ]
+        );
+
+        self::$firedChatMessageEntity = \Bitrix\Main\ORM\Entity::compileEntity(
+            'FiredChatMessageEntity',
+            [
+                (new \Bitrix\Main\ORM\Fields\IntegerField('ID'))->configurePrimary(),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('AUTHOR_ID')),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('CHAT_ID')),
+            ],
+            [
+                'table_name' => 'b_im_message'
+            ]
+        );
+
+        self::$firedMessageParamEntity = \Bitrix\Main\ORM\Entity::compileEntity(
+            'FiredMessageParamEntity',
+            [
+                (new \Bitrix\Main\ORM\Fields\IntegerField('ID'))->configurePrimary(),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('MESSAGE_ID')),
+                (new \Bitrix\Main\ORM\Fields\StringField('PARAM_NAME')),
+                (new \Bitrix\Main\ORM\Fields\StringField('PARAM_VALUE')),
+            ],
+            [
+                'table_name' => 'b_im_message_param'
+            ]
+        );
+
+        self::$firedFileMessageEntity = \Bitrix\Main\ORM\Entity::compileEntity(
+            'FiredFileMessageEntity',
+            [
+                (new \Bitrix\Main\ORM\Fields\IntegerField('ID'))->configurePrimary(),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('FILE_ID')),
+            ],
+            [
+                'table_name' => 'b_disk_object'
+            ]
+        );
+
+        self::$firedRelationEntity = \Bitrix\Main\ORM\Entity::compileEntity(
+            'FiredRelationEntity',
+            [
+                (new \Bitrix\Main\ORM\Fields\IntegerField('ID'))->configurePrimary(),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('CHAT_ID')),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('USER_ID')),
+            ],
+            [
+                'table_name' => 'b_im_relation'
+            ]
+        );
+    }
+
+    /**
+     * Получение списка уволенных сотрудников, для которых нужно удалить чат
+     * @return array
+     * @throws \Bitrix\Main\ArgumentException
+     * @throws \Bitrix\Main\ObjectPropertyException
+     * @throws \Bitrix\Main\SystemException
+     */
+    private static function getFiredEmployees()
+    {
+        $userEntity = UserTable::getEntity();
+        $currentDate = date('d.m.Y');
+
+        $resUsersFired = (new \Bitrix\Main\ORM\Query\Query($userEntity))
+            ->setSelect(['ID', 'UF_CHAT_DELETE_RANGE', 'UF_DATE_FIRED_EMPLOYEES', 'UF_CHAT_IS_DELETE'])
+            ->setFilter([
+                'ACTIVE' => 'N',
+                'UF_CHAT_IS_DELETE' => false
+            ])
+            ->whereNotNull('UF_DATE_FIRED_EMPLOYEES')
+            ->whereNotNull('UF_CHAT_DELETE_RANGE')
+            ->exec()
+            ->fetchAll();
+
+        $valuesFieldRange = self::getValueFieldChatDeleteRange();
+
+        /**
+         * Рассчитаем дату удаления чатов и сравним с текущей.
+         * Если дата удаления прошла или наступает сегодня, оставим в списке очистки.
+         */
+        if (!empty($valuesFieldRange) && !empty($resUsersFired)) {
+            foreach ($resUsersFired as $keyUser => &$userFired) {
+                if (!empty($valuesFieldRange[$userFired['UF_CHAT_DELETE_RANGE']]['XML_ID'])) {
+                    $userFired['UF_CHAT_DELETE_RANGE'] = (int)str_replace(
+                        'CHAT_DELETE_RANGE_',
+                        '',
+                        $valuesFieldRange[$userFired['UF_CHAT_DELETE_RANGE']]['XML_ID']
+                    );
+                }
+
+                if (
+                    !empty($userFired['UF_CHAT_DELETE_RANGE'])
+                    && is_int($userFired['UF_CHAT_DELETE_RANGE'])
+                    && !empty($userFired['UF_DATE_FIRED_EMPLOYEES'])
+                ) {
+                    $dateFiredCurrentEmployee = strtotime($userFired['UF_DATE_FIRED_EMPLOYEES']->toString());
+                    $rangeCurrentEmployee = '+' . $userFired['UF_CHAT_DELETE_RANGE'] . ' month';
+
+                    $dateDeleteChatCurrentEmployee = date('d.m.Y', strtotime($rangeCurrentEmployee, $dateFiredCurrentEmployee));
+
+                    if (strtotime($dateDeleteChatCurrentEmployee) > strtotime($currentDate)) {
+                        unset($resUsersFired[$keyUser]);
+                    }
+                }
+            }
+        }
+
+        return $resUsersFired;
+    }
+
+    /**
+     * Получение значений списочного поля диапазона удаления чатов
+     * @return array
+     */
+    private static function getValueFieldChatDeleteRange()
+    {
+        $valuesChatDeleteRange = [];
+
+        $fieldChatDeleteRange = self::getUserFieldByCode(self::FIELD_CHAT_DELETE_RANGE);
+
+        $entityEnumFieldChatDeleteRange = \Bitrix\Main\ORM\Entity::compileEntity(
+            'EntityEnumFieldChatDeleteRange',
+            [
+                (new \Bitrix\Main\ORM\Fields\IntegerField('ID'))->configurePrimary(),
+                (new \Bitrix\Main\ORM\Fields\IntegerField('USER_FIELD_ID')),
+                (new \Bitrix\Main\ORM\Fields\StringField('XML_ID')),
+            ],
+            [
+                'table_name' => 'b_user_field_enum'
+            ]
+        );
+
+        if ($fieldChatDeleteRangeData = $fieldChatDeleteRange->Fetch()) {
+            $queryFieldChatDeleteRange = new \Bitrix\Main\ORM\Query\Query($entityEnumFieldChatDeleteRange);
+            $resFieldChatDeleteRange = $queryFieldChatDeleteRange
+                ->setSelect(['ID', 'USER_FIELD_ID', 'XML_ID'])
+                ->addFilter('USER_FIELD_ID', $fieldChatDeleteRangeData['ID'])
+                ->exec()
+                ->fetchAll();
+
+            if (!empty($resFieldChatDeleteRange)) {
+                $valuesChatDeleteRange = array_column($resFieldChatDeleteRange, null, 'ID');
+            }
+        }
+
+        return $valuesChatDeleteRange;
+    }
+
+    /**
+     * Запуск процесса сбора данных и удаления
+     * @return void
+     */
+    public static function startProcessDeleteImFiredEmployee()
+    {
+        $arrDeleteDataFiredEmployee = [];
+        $userFired = self::getFiredEmployees();
+
+        if (!empty($userFired)) {
+            self::compileEntitys();
+
+            $userFired = array_column($userFired, null, 'ID');
+
+            foreach ($userFired as $employeeID => $employeeData) {
+                if (!isset($arrDeleteDataFiredEmployee[$messageData['AUTHOR_ID']])) {
+                    $arrDeleteDataFiredEmployee[$employeeID] = [
+                        'MESSAGE_ID' => [], //сообщения для удаления
+                        'CHAT_ID' => [],
+                        'OWNER_CHAT_ID' => [], //чаты для удаления
+                        'FILE_ID_TEMP' => [],
+                        'FILE_ID' => [], //файлы для удаления
+                        'PARAM_ID' => [], //параметры сообщений для удаления
+                        'RELATION_ID' => [], //доп. данные сообщений для удаления
+                    ];
+                }
+            }
+
+            $resOwnedChat = self::getOwnedChatFiredEmployees(array_keys($userFired));
+
+            if (!empty($resOwnedChat)) {
+                foreach ($resOwnedChat as $ownedChat) {
+                    if (!in_array($ownedChat['OWNED_CHAT_ID'], $arrDeleteDataFiredEmployee[$ownedChat['AUTHOR_ID']]['OWNER_CHAT_ID'], true)) {
+                        $arrDeleteDataFiredEmployee[$ownedChat['AUTHOR_ID']]['OWNER_CHAT_ID'][] = $ownedChat['OWNED_CHAT_ID'];
+                    }
+                }
+            }
+
+            $resRelationMessage = self::getRelationFiredMessage(array_keys($userFired));
+
+            if (!empty($resRelationMessage)) {
+                foreach ($resRelationMessage as $relationMess) {
+                    if (!in_array($relationMess['RELATION_ID'], $arrDeleteDataFiredEmployee[$relationMess['USER_ID']]['RELATION_ID'], true)) {
+                        $arrDeleteDataFiredEmployee[$relationMess['USER_ID']]['RELATION_ID'][] = $relationMess['RELATION_ID'];
+                    }
+                }
+            }
+
+            $queryFiredChatMessages = new \Bitrix\Main\ORM\Query\Query(self::$firedChatMessageEntity);
+            $resMessagesFired = $queryFiredChatMessages
+                ->setSelect(['MESSAGE_ID' => 'ID', 'AUTHOR_ID', 'CHAT_ID'])
+                ->addFilter('AUTHOR_ID', array_keys($userFired))
+                ->addGroup('AUTHOR_ID', 'ASC')
+                ->exec()
+                ->fetchAll();
+
+            if (!empty($resMessagesFired)) {
+                foreach ($resMessagesFired as $messageData) {
+                    if (!in_array($messageData['MESSAGE_ID'], $arrDeleteDataFiredEmployee[$messageData['AUTHOR_ID']]['MESSAGE_ID'], true)) {
+                        $arrDeleteDataFiredEmployee[$messageData['AUTHOR_ID']]['MESSAGE_ID'][] = $messageData['MESSAGE_ID'];
+                    }
+
+                    if (!in_array($messageData['CHAT_ID'], $arrDeleteDataFiredEmployee[$messageData['AUTHOR_ID']]['CHAT_ID'], true)) {
+                        $arrDeleteDataFiredEmployee[$messageData['AUTHOR_ID']]['CHAT_ID'][] = $messageData['CHAT_ID'];
+                    }
+                }
+            }
+
+            foreach ($arrDeleteDataFiredEmployee as $employeeID => $deleteDataFired) {
+                $paramsCurrentMessages = self::getMessageParam($deleteDataFired['MESSAGE_ID']);
+
+                if (!empty($paramsCurrentMessages)) {
+                    foreach ($paramsCurrentMessages as $paramMessage) {
+                        if (!in_array($paramMessage['PARAM_ID'], $arrDeleteDataFiredEmployee[$employeeID]['PARAM_ID'], true)) {
+                            $arrDeleteDataFiredEmployee[$employeeID]['PARAM_ID'][] = $paramMessage['PARAM_ID'];
+                        }
+
+                        if (
+                            $paramMessage['PARAM_NAME'] === 'FILE_ID'
+                            && !in_array($paramMessage['PARAM_VALUE'], $arrDeleteDataFiredEmployee[$employeeID]['FILE_ID_TEMP'], true)
+                        ) {
+                            $arrDeleteDataFiredEmployee[$employeeID]['FILE_ID_TEMP'][] = $paramMessage['PARAM_VALUE'];
+                        }
+                    }
+                }
+
+                if (!empty($arrDeleteDataFiredEmployee[$employeeID]['FILE_ID_TEMP'])) {
+                    $arrDeleteDataFiredEmployee[$employeeID]['FILE_ID'] = self::getOriginalFileData($arrDeleteDataFiredEmployee[$employeeID]['FILE_ID_TEMP']);
+
+                    unset($arrDeleteDataFiredEmployee[$employeeID]['FILE_ID_TEMP']);
+                }
+            }
+
+            self::deleteChatDataFiredUser($arrDeleteDataFiredEmployee);
+        }
+    }
+
+    /**
+     * Обработка данных для удаления чатов уволенных сотрудников
+     * @return void
+     */
+    private static function deleteChatDataFiredUser($deleteDatas)
+    {
+        if (!empty($deleteDatas)) {
+            foreach ($deleteDatas as $idUser => $deleteData) {
+                /**
+                 * Удаление файлов
+                 */
+                if (!empty($deleteData['FILE_ID'])) {
+                    self::deleteFilesFiredEmployee($deleteData['FILE_ID']);
+                }
+
+                /**
+                 * Удаление параметров сообщений
+                 */
+                if (!empty($deleteData['PARAM_ID'])) {
+                    self::deleteMessagesParamFiredEmployee($deleteData['PARAM_ID']);
+                }
+
+                /**
+                 * Удаление доп. параметров сообщений
+                 */
+                if (!empty($deleteData['RELATION_ID'])) {
+                    self::deleteRelationMessagesFiredEmployee($deleteData['RELATION_ID']);
+                }
+
+                /**
+                 * Удаление сообщений
+                 */
+                if (!empty($deleteData['MESSAGE_ID'])) {
+                    self::deleteMessagesFiredEmployee($deleteData['MESSAGE_ID']);
+                }
+
+                /**
+                 * Удаление записей из таблицы недавних
+                 */
+                self::deleteRecentDataFiredEmployee($idUser);
+
+                /**
+                 * Удаление чатов и индекса чатов
+                 */
+                if (!empty($deleteData['OWNER_CHAT_ID'])) {
+                    self::deleteChatFiredEmployee($deleteData['OWNER_CHAT_ID']);
+                }
+
+                /**
+                 * Делаем пометку, что чаты удалены
+                 */
+                self::setFlagDeleteChatsEmployee($idUser);
+            }
+
+        }
+    }
+
+    /**
+     * Удаление файлов вложений
+     * @param $files
+     * @return void
+     */
+    private static function deleteFilesFiredEmployee($files)
+    {
+        foreach ($files as $fileID) {
+            \CFile::Delete($fileID);
+        }
+    }
+
+    /**
+     * Удаление параметров сообщений
+     * @param $params
+     * @return void
+     * @throws \Exception
+     */
+    private static function deleteMessagesParamFiredEmployee($params)
+    {
+        foreach ($params as $paramID) {
+            MessageParamTable::delete($paramID);
+        }
+    }
+
+    /**
+     * Удаление доп. данных сообщений
+     * @param $relations
+     * @return void
+     * @throws \Exception
+     */
+    private static function deleteRelationMessagesFiredEmployee($relations)
+    {
+        foreach ($relations as $relationID) {
+            RelationTable::delete($relationID);
+        }
+    }
+
+    /**
+     * Удаление сообщений
+     * @param $messages
+     * @return void
+     * @throws \Exception
+     */
+    private static function deleteMessagesFiredEmployee($messages)
+    {
+        foreach ($messages as $messageID) {
+            MessageTable::delete($messageID);
+        }
+    }
+
+    /**
+     * Удаление чатов и индекса чатов
+     * @param $chats
+     * @return void
+     * @throws \Exception
+     */
+    private static function deleteChatFiredEmployee($chats)
+    {
+        foreach ($chats as $chatID) {
+            ChatIndexTable::delete($chatID);
+
+            ChatTable::delete($chatID);
+        }
+    }
+
+    /**
+     * Отмечаем что чаты пользователя удалены
+     * @param $userID
+     * @return void
+     */
+    private static function setFlagDeleteChatsEmployee($userID)
+    {
+        $oUser = new CUser;
+        $aFields = [self::FIELD_CHAT_IS_DELETE => true];
+
+        $oUser->Update($userID, $aFields);
+    }
+
+    /**
+     * Получение приватных чатов, где создателем был уволенный сотрудник (групповые не буду удалять)
+     * @param $userFiredID
+     * @return array
+     * @throws \Bitrix\Main\ArgumentException
+     * @throws \Bitrix\Main\ObjectPropertyException
+     * @throws \Bitrix\Main\SystemException
+     */
+    private static function getOwnedChatFiredEmployees($userFiredID)
+    {
+        $queryFiredChat = new \Bitrix\Main\ORM\Query\Query(self::$firedChatEntity);
+
+        return $queryFiredChat
+            ->setSelect(['OWNED_CHAT_ID' => 'ID', 'AUTHOR_ID'])
+            ->addFilter('AUTHOR_ID', $userFiredID)
+            ->whereNotIn('TYPE', 'P')
+            ->addGroup('AUTHOR_ID', 'ASC')
+            ->exec()
+            ->fetchAll();
+    }
+
+    /**
+     * Получаем параметры сообщений, для дальнейшей очистки и определения вложений
+     * @param array $messageIDs
+     * @return array
+     * @throws \Bitrix\Main\ArgumentException
+     * @throws \Bitrix\Main\ObjectPropertyException
+     * @throws \Bitrix\Main\SystemException
+     */
+    private static function getMessageParam(array $messageIDs = [])
+    {
+        $resFiredMessageParam = [];
+
+        if (!empty($messageIDs)) {
+            $queryFiredMessageParam = new \Bitrix\Main\ORM\Query\Query(self::$firedMessageParamEntity);
+            $resFiredMessageParam = $queryFiredMessageParam
+                ->setSelect(['PARAM_ID' => 'ID', 'MESSAGE_ID', 'PARAM_NAME', 'PARAM_VALUE'])
+                ->addFilter('MESSAGE_ID', $messageIDs)
+                ->exec()
+                ->fetchAll();
+        }
+
+        return $resFiredMessageParam;
+    }
+
+    /**
+     * Получение дополнительной информации по сообщениям (прочитано или нет, дата просмотра и т.д.)
+     * @param $userFiredID
+     * @return array
+     * @throws \Bitrix\Main\ArgumentException
+     * @throws \Bitrix\Main\ObjectPropertyException
+     * @throws \Bitrix\Main\SystemException
+     */
+    private static function getRelationFiredMessage($userFiredID)
+    {
+        $queryRelationFiredMessage = new \Bitrix\Main\ORM\Query\Query(self::$firedRelationEntity);
+
+        return $queryRelationFiredMessage
+            ->setSelect(['RELATION_ID' => 'ID', 'USER_ID'])
+            ->addFilter('USER_ID', $userFiredID)
+            ->addGroup('USER_ID', 'ASC')
+            ->exec()
+            ->fetchAll();
+    }
+
+    /**
+     * Получение оригинала id файла
+     * @param array $fileID
+     * @return array
+     * @throws \Bitrix\Main\ArgumentException
+     * @throws \Bitrix\Main\ObjectPropertyException
+     * @throws \Bitrix\Main\SystemException
+     */
+    private static function getOriginalFileData(array $fileID = [])
+    {
+        $resFiredFileMessage = [];
+
+        if (!empty($fileID)) {
+            $queryFiredFileMessage = new \Bitrix\Main\ORM\Query\Query(self::$firedFileMessageEntity);
+            $resFiredFileMessage = $queryFiredFileMessage
+                ->setSelect(['FILE_ID'])
+                ->addFilter('ID', $fileID)
+                ->exec()
+                ->fetchAll();
+
+            $resFiredFileMessage = array_column($resFiredFileMessage, 'FILE_ID');
+        }
+
+        return $resFiredFileMessage;
+    }
+
+    /**
+     * Удаление записей из таблицы недавних
+     * @param $employeeID
+     * @return DeleteResult
+     * @throws \Bitrix\Main\ArgumentException
+     * @throws \Bitrix\Main\SystemException
+     */
+    private static function deleteRecentDataFiredEmployee($employeeID)
+    {
+        $result = new DeleteResult();
+
+        if (!empty($employeeID)) {
+            try {
+                $recentEntity = \Bitrix\Im\Model\RecentTable::getEntity();
+                $connection = $recentEntity->getConnection();
+                $helper = $connection->getSqlHelper();
+
+                $tableName = $recentEntity->getDBTableName();
+
+                $where = $helper->prepareAssignment($tableName, 'USER_ID', $employeeID);
+                $sql = "DELETE FROM " . $helper->quote($tableName) . " WHERE " . $where;
+
+                $connection->queryExecute($sql);
+
+                $recentEntity->cleanCache();
+            } catch (\Exception $e) {
+                $result->isSuccess();
+
+                throw $e;
+            }
+        }
+
+        return $result;
+    }
+}
+
+?>
